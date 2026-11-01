@@ -1,0 +1,9 @@
+# torch 需从 cu128 索引安装（Blackwell / sm_120），见 README
+# transformers 5.x 移除了 warmup_ratio、改用 dtype=，代码按 5.x 写
+torch>=2.7
+numpy
+transformers>=5.0
+peft>=0.13
+datasets>=3.0
+accelerate>=1.0
+safetensors
