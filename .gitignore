@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 训练产物：adapter、日志、meta
+outputs/
+
+# 评测结果
+eval/
+
+# 权重文件不入库
+*.safetensors
+*.bin
+*.pt
+
+# 模型缓存
+hf_cache/
+.hf_cache/
+.cache/
