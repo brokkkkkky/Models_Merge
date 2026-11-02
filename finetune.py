@@ -36,7 +36,7 @@ from common import (
 
 # 两个任务的默认 epoch 数：让训练步数都落在 8000 上下。
 # τ 的范数和训练步数正相关，步数差太多会让后续融合隐式加权。
-DEFAULT_EPOCHS = {"sst2": 2, "agnews": 1}
+DEFAULT_EPOCHS = {"sst2": 2, "agnews": 1, "cola": 3}
 
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 

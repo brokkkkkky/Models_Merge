@@ -72,6 +72,39 @@ CANDIDATES = {
             (" World", " Sports", " Business", " Technology"),
         ),
     ],
+    "cola": [
+        (
+            "C1 当前",
+            "Sentence: ",
+            "\nIs this sentence grammatically correct? Answer:",
+            (" no", " yes"),
+        ),
+        (
+            "C2 语法续写",
+            "Sentence: ",
+            "\nThis sentence is grammatically",
+            (" incorrect", " correct"),
+        ),
+        (
+            "C3 可接受性",
+            "Sentence: ",
+            "\nIs it grammatically acceptable? Answer:",
+            (" no", " yes"),
+        ),
+        (
+            "C4 明确指令",
+            "Sentence: ",
+            "\nDoes this sentence follow English grammar? Answer:",
+            (" no", " yes"),
+        ),
+        (
+            "C5 反向问错误",
+            "Sentence: ",
+            "\nIs there a grammar mistake in this sentence? Answer:",
+            # 注意顺序：0=unacceptable（有错）→ yes；1=acceptable（没错）→ no
+            (" yes", " no"),
+        ),
+    ],
 }
 
 

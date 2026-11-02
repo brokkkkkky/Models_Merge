@@ -64,6 +64,19 @@ TASKS: dict[str, TaskSpec] = {
         suffix="\nThis article belongs to the category",
         label_words=(" World", " Sports", " Business", " Technology"),
     ),
+    "cola": TaskSpec(
+        name="cola",
+        dataset="nyu-mll/glue",
+        config="cola",
+        train_split="train",
+        val_split="validation",
+        text_field="sentence",
+        label_field="label",
+        prefix="Sentence: ",
+        suffix="\nIs this sentence grammatically correct? Answer:",
+        # 0 = unacceptable, 1 = acceptable
+        label_words=(" no", " yes"),
+    ),
 }
 
 
