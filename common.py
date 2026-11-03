@@ -33,6 +33,9 @@ class TaskSpec:
     prefix: str
     suffix: str
     label_words: tuple[str, ...]  # 顺序必须和数据集里的 label 整数一一对应
+    # 双句任务（NLI 类）用第二字段；为 None 时是单句任务
+    text_field2: str | None = None
+    joiner: str = " Hypothesis: "
 
 
 TASKS: dict[str, TaskSpec] = {
@@ -75,6 +78,82 @@ TASKS: dict[str, TaskSpec] = {
         prefix="Sentence: ",
         suffix="\nIs this sentence grammatically correct? Answer:",
         # 0 = unacceptable, 1 = acceptable
+        label_words=(" no", " yes"),
+    ),
+    # ---- 方案 A：GLUE 双句任务（格式统一，判断内容不同）----
+    "mnli": TaskSpec(
+        name="mnli",
+        dataset="nyu-mll/glue",
+        config="mnli",
+        train_split="train",
+        val_split="validation_matched",
+        text_field="premise",
+        text_field2="hypothesis",
+        label_field="label",
+        prefix="Premise: ",
+        joiner="\nHypothesis: ",
+        suffix="\nWhat is the relation between the premise and the hypothesis? Answer:",
+        # 0 entailment, 1 neutral, 2 contradiction（"entailment" 会被切成两 token，用小写词干）
+        label_words=(" entail", " neutral", " contradiction"),
+    ),
+    "qnli": TaskSpec(
+        name="qnli",
+        dataset="nyu-mll/glue",
+        config="qnli",
+        train_split="train",
+        val_split="validation",
+        text_field="question",
+        text_field2="sentence",
+        label_field="label",
+        prefix="Question: ",
+        joiner="\nSentence: ",
+        suffix="\nDoes the sentence contain the answer to the question? Answer:",
+        # 0 entailment, 1 not_entailment
+        label_words=(" yes", " no"),
+    ),
+    "rte": TaskSpec(
+        name="rte",
+        dataset="nyu-mll/glue",
+        config="rte",
+        train_split="train",
+        val_split="validation",
+        text_field="sentence1",
+        text_field2="sentence2",
+        label_field="label",
+        prefix="Premise: ",
+        joiner="\nHypothesis: ",
+        suffix="\nDoes the premise entail the hypothesis? Answer:",
+        # 0 entailment, 1 not_entailment
+        label_words=(" yes", " no"),
+    ),
+    "qqp": TaskSpec(
+        name="qqp",
+        dataset="nyu-mll/glue",
+        config="qqp",
+        train_split="train",
+        val_split="validation",
+        text_field="question1",
+        text_field2="question2",
+        label_field="label",
+        prefix="Question 1: ",
+        joiner="\nQuestion 2: ",
+        suffix="\nAre these two questions duplicates? Answer:",
+        # 0 not_duplicate, 1 duplicate
+        label_words=(" no", " yes"),
+    ),
+    "mrpc": TaskSpec(
+        name="mrpc",
+        dataset="nyu-mll/glue",
+        config="mrpc",
+        train_split="train",
+        val_split="validation",
+        text_field="sentence1",
+        text_field2="sentence2",
+        label_field="label",
+        prefix="Sentence 1: ",
+        joiner="\nSentence 2: ",
+        suffix="\nDo these two sentences mean the same thing? Answer:",
+        # 0 not_equivalent, 1 equivalent（"paraphrase" 会被切成两 token）
         label_words=(" no", " yes"),
     ),
 }
@@ -218,7 +297,12 @@ def evaluate(
     n_classes = len(label_token_ids)
     device = next(model.parameters()).device
 
-    total = len(dataset) if max_samples in (None, 0) else min(max_samples, len(dataset))
+    # 有些数据集按标签排序（如 IMDB 的 test 前 12500 条全是负类），
+    # 直接取前 N 条会拿到单一类别，所以先打乱再抽样
+    if max_samples and max_samples < len(dataset):
+        dataset = dataset.shuffle(seed=0).select(range(max_samples))
+
+    total = len(dataset)
     if total == 0:
         raise ValueError("评测集为空")
 
@@ -238,6 +322,11 @@ def evaluate(
             end = min(start + batch_size, total)
             rows = dataset[start:end]
             texts = rows[spec.text_field]
+            if spec.text_field2:
+                texts = [
+                    a + spec.joiner + b
+                    for a, b in zip(texts, rows[spec.text_field2])
+                ]
             golds = [int(g) for g in rows[spec.label_field]]
 
             id_list = [build_prompt_ids(tokenizer, spec, t, max_len)[0] for t in texts]

@@ -36,7 +36,7 @@ from common import (
 
 # 两个任务的默认 epoch 数：让训练步数都落在 8000 上下。
 # τ 的范数和训练步数正相关，步数差太多会让后续融合隐式加权。
-DEFAULT_EPOCHS = {"sst2": 2, "agnews": 1, "cola": 3}
+DEFAULT_EPOCHS = {"sst2": 2, "agnews": 1, "cola": 3, "mnli": 1, "qnli": 1, "qqp": 1, "rte": 10, "mrpc": 7}
 
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
@@ -72,8 +72,11 @@ def build_rows(spec, tokenizer, split, max_len, max_samples, seed, data_path):
     rows = []
     truncated = 0
     for ex in ds:
+        text = ex[spec.text_field]
+        if spec.text_field2:
+            text = text + spec.joiner + ex[spec.text_field2]
         ids, labels, trunc = build_example(
-            tokenizer, spec, ex[spec.text_field], int(ex[spec.label_field]), max_len
+            tokenizer, spec, text, int(ex[spec.label_field]), max_len
         )
         truncated += int(trunc)
         rows.append({"input_ids": ids, "labels": labels})
