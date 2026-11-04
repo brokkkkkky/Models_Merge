@@ -105,7 +105,6 @@ def main() -> None:
     if missing:
         raise ValueError("模型模块缺失")
 
-    total_sq = 0.0
     with torch.no_grad():
         # 对每一层的不同矩阵使用TIES MERGING
         for idx, name in enumerate(modules,1):
@@ -117,12 +116,10 @@ def main() -> None:
 
             # 调用TIES 计算τ
             tau = ties_merge(deltas, keep = args.trim)
-            total_sq += float((tau ** 2).sum())
 
             w = named[name].weight
             w.add_(tau.to(w.device, w.dtype) * args.lam)
 
-    print(f"||tau_m|| = {total_sq ** 0.5:.1f}", flush=True)
     if args.dry_run:
         print("dry_run:未保存", flush = True)
         return
