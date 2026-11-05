@@ -40,7 +40,9 @@ DEFAULT_EPOCHS = {"sst2": 2, "agnews": 1, "cola": 3, "mnli": 1, "qnli": 1, "qqp"
 
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
-
+# 应用：trainer
+# Dataset.from_list(rows) 里每条样本的 input_ids / labels 长度都不同
+# PyTorch 模型要求一个 batch 里所有样本的形状一致，所以必须补到同一长度
 class CausalCollator:
     """按 batch 内最长做动态 padding，labels 的 padding 位填 -100。"""
 
@@ -49,6 +51,7 @@ class CausalCollator:
 
     def __call__(self, features):
         max_len = max(len(f["input_ids"]) for f in features)
+
         input_ids = torch.full((len(features), max_len), self.pad_token_id, dtype=torch.long)
         attention_mask = torch.zeros((len(features), max_len), dtype=torch.long)
         labels = torch.full((len(features), max_len), -100, dtype=torch.long)
@@ -124,7 +127,7 @@ def main() -> None:
     label_ids = check_label_words(tokenizer, spec)
     print("标签词 token id:", dict(zip(spec.label_words, label_ids)))
 
-    # ---- 数据 ----
+    # ---- 构造训练数据 ----
     rows, truncated = build_rows(
         spec, tokenizer, spec.train_split, args.max_len, args.max_samples, args.seed, args.data_path
     )
@@ -146,7 +149,8 @@ def main() -> None:
     else:
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
-
+    
+    # lora 参数
     lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -170,6 +174,7 @@ def main() -> None:
     total_steps = max(1, int(steps_per_epoch * epochs))
     warmup_steps = max(1, int(total_steps * 0.03))
 
+    # 训练时的参数
     training_args = TrainingArguments(
         output_dir=os.path.join(out_dir, "run"),
         per_device_train_batch_size=args.bs,
