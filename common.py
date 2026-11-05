@@ -247,9 +247,10 @@ def build_example(
     prompt_ids, truncated = build_prompt_ids(tokenizer, spec, text, max_len, answer_len=2)
 
     # inputs_id作为训练时的输入，labels作为训练时的监督信号
+    # 加answer_ids和eos_id 是为了计算loss ，就算anser预测失败，也加上正确的去预测eos
     input_ids = prompt_ids + answer_ids + [tokenizer.eos_token_id]
 
-    # 只对两个位置计算损失
+    # 只对两个位置（answer 和 eos）计算损失
     labels = [-100] * len(prompt_ids) + answer_ids + [tokenizer.eos_token_id]
     return input_ids, labels, truncated
 
