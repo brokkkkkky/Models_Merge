@@ -3,6 +3,7 @@ import json
 import os
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -51,6 +52,78 @@ def load_adapter(adapter_dir: str) -> dict[str, dict[str, torch.Tensor]]:
     return grouped
 
 
+WEIGHT_SUFFIX = ".weight"
+
+
+class AdapterDelta:
+    """
+    LoRA adapter：delta = B @ A * (alpha / r)。
+
+    这段计算原来内联在 merge() 里，搬到类里是为了让 ties/dare 脚本和全参
+    checkpoint 共用同一套接口，数值上与原实现逐位一致。
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.scale = load_scale(path)
+        self._t = load_adapter(path)
+        self.names = set(self._t)
+
+    def delta(self, name: str, base_weight: torch.Tensor) -> torch.Tensor:
+        p = self._t[name]
+        return (p["B"].float() @ p["A"].float()) * self.scale
+
+
+class FullFTDelta:
+    """
+    全参微调 checkpoint：delta = W_ft - W_base。
+
+    safe_open 是内存映射，按张量读取，7 个 checkpoint 不会同时整块进内存。
+    注意 Qwen2.5 的 tie_word_embeddings=true 会让 save_pretrained 去重
+    lm_head.weight，所以用 base_set & set(named) 取交集即可自动跳过它。
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        sd = os.path.join(path, "model.safetensors")
+
+        # 判断是否存在
+        if not os.path.exists(sd):
+            if os.path.exists(os.path.join(path, "model.safetensors.index.json")):
+                raise ValueError(f"{path} 是分片 checkpoint，本实现不支持")
+            raise FileNotFoundError(f"找不到 {sd}")
+        
+        self._h = safe_open(sd, framework="pt", device="cpu")
+        self.names = {
+            k[: -len(WEIGHT_SUFFIX)] for k in self._h.keys() if k.endswith(WEIGHT_SUFFIX)
+        }
+    
+    # 计算任务向量
+    def delta(self, name: str, base_weight: torch.Tensor) -> torch.Tensor:
+        # 一律在 CPU 上算：embed_tokens 这类大模块的 fp32 delta 有 500 MB 以上，
+        # 7 份同时留在显存里会 OOM
+        w = self._h.get_tensor(name + WEIGHT_SUFFIX).to(torch.float32)
+        base = base_weight.detach().to(device="cpu", dtype=torch.float32)
+        return w - base
+
+
+def open_source(path: str):
+    """
+    按目录里的特征文件识别 delta 来源：
+    1. <dir>/adapter_model.safetensors → LoRA adapter
+    2. <dir>/model.safetensors         → 全参微调 checkpoint
+    """
+
+    if os.path.exists(os.path.join(path, "adapter_model.safetensors")):
+        return AdapterDelta(path)
+    if os.path.exists(os.path.join(path, "model.safetensors")):
+        return FullFTDelta(path)
+    raise FileNotFoundError(
+        f"{path} 下既没有 adapter_model.safetensors 也没有 model.safetensors。"
+        f"LoRA 请指向 outputs/<task>/adapter，全参请指向 outputs_ft/<task>/model"
+    )
+
+# Lora微调使用
 def merge(base, specs, out) -> None:
     """specs: [(adapter_dir, lam), ...]，任意个，lam 可以为负。"""
 
@@ -145,6 +218,52 @@ def merge(base, specs, out) -> None:
     tokenizer.save_pretrained(out)
     print(f"完成 → {out}", flush=True)
 
+# 全参数微调使用
+def merge_sources(specs, out: str, base: str) -> None:
+    """
+    全参微调 checkpoint 的合并：theta0 + sum_i lam_i * (W_ft_i - W_base)。
+
+    specs: [(checkpoint_dir, lam), ...]
+    """
+
+    # 判断哪些模型是需要使用的
+    used = [(path, lam) for path, lam in specs if lam != 0.0]
+    if not used:
+        raise ValueError("所有 lam 都是 0，没有可合并的内容。")
+
+    sources = [open_source(path) for path, _ in used]
+    base_set = sources[0].names
+    
+    for s in sources[1:]:
+        if s.names != base_set:
+            raise ValueError(f"{s.path} 的模块集合与第一个不一致")
+
+    model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.bfloat16, device_map={"": 0})
+    tokenizer = AutoTokenizer.from_pretrained(base)
+
+    named = dict(model.named_modules())
+    # 取交集：tie_word_embeddings=True 时 lm_head.weight 会被去重，不在 names 里，
+    # 跳过它是正确的（更新 embed_tokens 等于更新 lm_head，不能加两次）
+    names = sorted(base_set & set(named))
+    skipped = sorted(base_set - set(named))
+    if skipped:
+        print(f"[提示] 跳过 {len(skipped)} 个 checkpoint 里有、模型里没有的模块，例如 {skipped[:3]}",
+              flush=True)
+
+    with torch.no_grad():
+        for name in names:
+            w = named[name].weight
+            total = None
+            for src, (_, lam) in zip(sources, used):
+                d = src.delta(name, w)
+                total = d * lam if total is None else total + d * lam
+            w.add_(total.to(w.device, w.dtype))
+
+    os.makedirs(out, exist_ok=True)
+    model.save_pretrained(out)
+    tokenizer.save_pretrained(out)
+    print(f"完成 → {out}（合并 {len(names)} 个模块）", flush=True)
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="任务算术: theta0 + sum_i lam_i * tau_i")
@@ -152,13 +271,15 @@ def parse_args():
     p.add_argument(
         "--adapters",
         default=DEFAULT_ADAPTERS,
-        help="逗号分隔的 adapter 目录，可以有 1 个或多个",
+        help="逗号分隔的目录，可以有 1 个或多个；LoRA 指向 adapter，全参指向 model",
     )
     p.add_argument(
         "--lams",
         default = None,
         help = "逗号分隔的权重，个数必须和 --adapters 一致，可为负数。不填则默认 1/n即对任务向量取平均",
     )
+    p.add_argument("--full_ft", action="store_true",
+                   help="输入是全参微调 checkpoint（<dir>/model.safetensors）")
     p.add_argument("--out", default=None)
     return p.parse_args()
 
@@ -190,15 +311,21 @@ def main() -> None:
             f"--adapters 有 {len(adapters)} 个，--lams 有 {len(lams)} 个，必须一样多"
         )
 
+    # 全参合并落到单独的目录前缀，避免和 LoRA 的 avg_N / lam... 互相覆盖
+    prefix = "outputs/merged_ft" if args.full_ft else "outputs/merged"
     if args.out:
         out = args.out
     elif auto:
-        out = f"outputs/merged/avg_{len(adapters)}"
+        out = f"{prefix}/avg_{len(adapters)}"
     else:
-        out = "outputs/merged/lam" + "_".join(fmt_lam(lam) for lam in lams)
+        out = f"{prefix}/lam" + "_".join(fmt_lam(lam) for lam in lams)
 
-    print(f"合并 {len(adapters)} 个 adapter，lam={lams} → {out}", flush=True)
-    merge(args.base, list(zip(adapters, lams)), out)
+    if args.full_ft:
+        print(f"合并 {len(adapters)} 个全参 checkpoint，lam={lams} → {out}", flush=True)
+        merge_sources(list(zip(adapters, lams)), out, args.base)
+    else:
+        print(f"合并 {len(adapters)} 个 adapter，lam={lams} → {out}", flush=True)
+        merge(args.base, list(zip(adapters, lams)), out)
 
 
 if __name__ == "__main__":

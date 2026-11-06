@@ -1,10 +1,10 @@
-"""单任务 LoRA 微调：训练 → 验证集打分 → 存 adapter。
+"""
+按照 --full_ft 来决定
 
-用法：
-    python finetune.py --task sst2
-    python finetune.py --task agnews
-
+1. 单任务 LoRA 微调：训练 → 验证集打分 → 存 adapter。
 只保存 LoRA 的 A/B 矩阵（几十 MB），不合并回底座。合并留到需要时再做。
+
+2. 单任务全参数微调
 """
 
 from __future__ import annotations
@@ -107,6 +107,10 @@ def parse_args():
                    help="数据加载进程数。0 最稳；训练慢且 bench 显示瓶颈在数据时试 2-4")
     p.add_argument("--no_grad_ckpt", action="store_true",
                    help="关闭 gradient checkpointing，快约 25%%，但多占约 1-2 GB 显存")
+
+    # 引入全参微调
+    p.add_argument("--full_ft", action="store_true",
+                   help="全参微调；不套 LoRA，完整权重存到 <out>/model")
     return p.parse_args()
 
 
@@ -142,25 +146,39 @@ def main() -> None:
         print("[警告] 拿不到 base 的 commit hash，meta.json 里会留空")
 
     model.config.use_cache = False
-    # 顺序很重要：先开 checkpointing，再让输入 embed 参与求导，
-    # 否则 LoRA 参数拿不到梯度，loss 完全不降。
-    if args.no_grad_ckpt:
-        print("gradient checkpointing: 关闭（用显存换速度）")
+
+    # 全参微调：不需要 LoRA
+    if args.full_ft:
+        if args.lr > 5e-5:
+            print(f"[警告] 全参微调 lr={args.lr} 偏大，建议 1e-5 ~ 2e-5", flush=True)
+        if not args.no_grad_ckpt:
+            model.gradient_checkpointing_enable()
+
+        # 列出可微调参数
+        n_train = sum(p.numel() for p in model.parameters())
+        print(f"[模式] 全参微调，可训练参数 {n_train/1e6:.1f}M", flush=True)
+
+    # 原有的Lora微调代码不变
     else:
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
-    
-    # lora 参数
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=TARGET_MODULES,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+        # 顺序很重要：先开 checkpointing，再让输入 embed 参与求导，
+        # 否则 LoRA 参数拿不到梯度，loss 完全不降。
+        if args.no_grad_ckpt:
+            print("gradient checkpointing: 关闭（用显存换速度）")
+        else:
+            model.gradient_checkpointing_enable()
+            model.enable_input_require_grads()
+
+        # lora 参数
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=TARGET_MODULES,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
 
     # 显式搬到显卡。Trainer 也会自己搬，但提前搬可以让显存问题在训练开始前暴露
     if torch.cuda.is_available():
@@ -217,12 +235,13 @@ def main() -> None:
     print_report(metrics)
 
     # ---- 保存 ----
-    adapter_dir = os.path.join(out_dir, "adapter")
-    model.save_pretrained(adapter_dir)
-    tokenizer.save_pretrained(adapter_dir)
+    ckpt_dir = os.path.join(out_dir, "model" if args.full_ft else "adapter")
+    model.save_pretrained(ckpt_dir)
+    tokenizer.save_pretrained(ckpt_dir)
 
     meta = {
         "task": spec.name,
+        "mode": "full_ft" if args.full_ft else "lora",
         "base_model": args.base,
         "base_commit": base_commit,
         "prompt": {
@@ -237,11 +256,17 @@ def main() -> None:
             "effective_batch": args.bs * args.grad_accum,
             "lr": args.lr,
             "epochs": epochs,
-            "lora_r": args.lora_r,
-            "lora_alpha": args.lora_alpha,
-            "lora_dropout": args.lora_dropout,
-            "target_modules": TARGET_MODULES,
             "seed": args.seed,
+            **(
+                {}
+                if args.full_ft
+                else {
+                    "lora_r": args.lora_r,
+                    "lora_alpha": args.lora_alpha,
+                    "lora_dropout": args.lora_dropout,
+                    "target_modules": TARGET_MODULES,
+                }
+            ),
         },
         "train": {
             "split": spec.train_split,
@@ -265,13 +290,15 @@ def main() -> None:
     }
     save_json(meta, os.path.join(out_dir, "meta.json"))
 
-    eval_path = os.path.join("eval", spec.name, f"{spec.name}.json")
+    # 全参微调用 _ft 后缀，避免覆盖 1.5B LoRA 的微调结果
+    suffix = "_ft" if args.full_ft else ""
+    eval_path = os.path.join("eval", spec.name, f"{spec.name}{suffix}.json")
     save_json(
-        {**metrics, "model": args.base, "adapter": adapter_dir, "commit": base_commit},
+        {**metrics, "model": args.base, "ckpt": ckpt_dir, "commit": base_commit},
         eval_path,
     )
 
-    print(f"\nadapter  → {adapter_dir}")
+    print(f"\nckpt     → {ckpt_dir}")
     print(f"meta     → {os.path.join(out_dir, 'meta.json')}")
     print(f"eval     → {eval_path}")
 

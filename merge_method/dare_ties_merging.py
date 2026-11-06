@@ -15,11 +15,18 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # load_adapter 和 load_scale 已经在 task_arithmetic.py 中实现了，直接导入即可。
-from task_arithmetic import load_adapter, load_scale
+from task_arithmetic import AdapterDelta, open_source
 
 # 对于dare + ties 这里需要调整
 def keep_top_k(delta:torch.Tensor, keep:float) -> torch.Tensor:
-    """只保留绝对值最大的 keep 比例，其余置零。"""
+    """只保留绝对值最大的 keep 比例，其余置零。
+
+    注意：这里按【非零元素】计数（flat_nz），而不是整个张量。DARE 之后多数
+    元素已经是 0，所以最终保留比例是 (1-p) × keep：
+        p=0.9, keep=0.2 → 2%
+        p=0.5, keep=0.4 → 20%
+    这个口径与已有的 LoRA 实验（record.xlsx）保持一致，刻意没有改。
+    """
     if keep >= 1.0:
         return delta.clone()
 
@@ -80,6 +87,8 @@ def parse_args():
     p.add_argument("--adapters", required=True, help="逗号分隔")
     p.add_argument("--lam", type=float, default=1.0, help="默认 1.0，不要除以 n")
     p.add_argument("--trim", type=float, default=0.2)
+    p.add_argument("--skip_embed", action="store_true",
+                   help="跳过 model.embed_tokens / lm_head，全参合并时省内存")
     p.add_argument("--max_modules", type=int, default=0, help="调试用，0=全部")
     p.add_argument("--dry_run", action="store_true", help="只算不存")
     p.add_argument("--out", default=None)
@@ -99,17 +108,17 @@ def main() -> None:
         if s.strip():
             paths.append(s.strip())
 
-    groups = [
-        {"path":p, "scale":load_scale(p), "tensors":load_adapter(p)} for p in paths
-    ]
+    groups = [open_source(p) for p in paths]
 
-    base_set = set(groups[0]["tensors"])
+    base_set = groups[0].names
     # 判断模块是否一致
     for g in groups[1:]:
-        if set(g["tensors"]) != base_set:
-            raise ValueError("模块集合不一致")
+        if g.names != base_set:
+            raise ValueError(f"{g.path} 的模块集合与第一个不一致")
 
     modules = sorted(base_set)
+    if args.skip_embed:
+        modules = [m for m in modules if m not in ("model.embed_tokens", "lm_head")]
     if args.max_modules:
         modules = modules[:args.max_modules]
 
@@ -122,14 +131,14 @@ def main() -> None:
 
     named = dict(model.named_modules())
 
-    # 检查是否缺失
-    missing = []
-    for n in modules:
-        if n not in named:
-            missing.append(n)
+    # 检查是否缺失：LoRA 必须完全对得上；全参 checkpoint 里被去重的 lm_head 可以跳过
+    missing = [n for n in modules if n not in named]
 
     if missing:
-        raise ValueError("模型模块缺失")
+        if isinstance(groups[0], AdapterDelta):
+            raise ValueError(f"模型模块缺失: {missing[:5]}")
+        print(f"[提示] 跳过 {len(missing)} 个底座里没有的模块，例如 {missing[:3]}", flush=True)
+        modules = [n for n in modules if n in named]
 
     # 掩码生成的规则
     gen = torch.Generator().manual_seed(args.seed)
@@ -139,13 +148,8 @@ def main() -> None:
         for idx, name in enumerate(modules,1):
             deltas = []
             for g in groups:
-                # LORA的 A,B 矩阵
-                pair = g["tensors"][name]
-                #deltas.append((pair["B"].float() @ pair["A"].float()) * g["scale"])
-
-                # 引入 DARE 的写法
-                d = (pair["B"].float() @ pair["A"].float()) * g["scale"]
-                deltas.append(dare(d, args.p, gen))
+                # 引入 DARE 的写法：先取 delta，再随机丢弃
+                deltas.append(dare(g.delta(name, named[name].weight), args.p, gen))
 
             # 调用TIES 计算τ
             tau = ties_merge(deltas, keep = args.trim)
@@ -157,7 +161,7 @@ def main() -> None:
         print("dry_run:未保存", flush = True)
         return
 
-    out = args.out or "outputs/merged/ties"
+    out = args.out or "outputs/merged/dare_ties"
     os.makedirs(out, exist_ok=True)
     model.save_pretrained(out)
     tokenizer.save_pretrained(out)
