@@ -39,6 +39,10 @@ def keep_top_k(delta:torch.Tensor, keep:float) -> torch.Tensor:
     # kthvalue 是 O(N) 选择算法，比 quantile 的排序快 3-5 倍，且精确
     # j = N×(1−keep) 是升序第 j 小的数，正好是"保留 keep 比例"的分界点
     n = flat_nz.numel()
+    if n == 0:
+        # 全零张量：RMSNorm 在 bf16 下常常和底座逐位相同，或被 DARE 全丢光。
+        # 没有可裁剪的元素，直接原样返回（后续 add 的就是 0，等于不动权重）
+        return delta.clone()
     k = max(1, int(round(n * keep)))       # 保留 k 个
     j = n - k + 1                          # 第 k 大的名次（升序）
 
