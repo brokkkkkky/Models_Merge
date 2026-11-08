@@ -96,9 +96,11 @@ def main() -> None:
     )
     base_commit = getattr(model.config, "_commit_hash", None)
 
+    # 有 adapter 就加adpter
     if args.adapter:
         model = PeftModel.from_pretrained(model, args.adapter)
         print(f"已挂载 adapter: {args.adapter}", flush=True)
+    
     model.eval()
     print("[3/3] 开始评测 …", flush=True)
 
