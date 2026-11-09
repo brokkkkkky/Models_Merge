@@ -1,12 +1,16 @@
-"""ties_cma_es.py — 用 CMA-ES / 坐标下降搜索 TIES 的逐任务 λ。
+"""ties_cma_es.py — 用 CMA-ES 搜索 TIES 的逐任务 λ。
 
 和 ties_merging.py 的区别：
   1. 模型只加载一次，合并/回滚都在显存里做，搜索期间不落盘
   2. 目标函数 = 若干任务的平均准确率（--eval_max_samples 可做代理评测）
-  3. 搜索器：cmaes（需 pip install cma）或 cd（坐标下降）
+  3. 用 CMA-ES 在 λ 空间里搜索，边界 [--lo, --hi]
   4. 搜索结束用全量复核 top-k，只保存最好的那个
 
-λ 的顺序和 --adapters 一致。
+λ 的顺序和 --adapters 一致，例如
+    mnli,qnli,rte,qqp,mrpc,sst2,cola
+对应 lams=[λ_mnli, λ_qnli, ...]。
+
+需要先安装：pip install cma
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ TASK_ORDER = ["mnli", "qnli", "rte", "qqp", "mrpc", "sst2", "cola"]
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="用 CMA-ES / 坐标下降搜 TIES 的逐任务 λ")
+    p = argparse.ArgumentParser(description="用 CMA-ES 搜 TIES 的逐任务 λ")
     p.add_argument("--base", default="Qwen/Qwen2.5-1.5B")
     p.add_argument("--adapters", required=True, help="逗号分隔，顺序对应 λ")
     p.add_argument("--tasks", default=",".join(TASK_ORDER), help="逗号分隔，和 adapters 对齐")
@@ -41,14 +45,12 @@ def parse_args():
     p.add_argument("--skip_embed", action="store_true")
     p.add_argument("--max_modules", type=int, default=0, help="调试用，0=全部")
 
-    p.add_argument("--mode", default="cmaes", choices=["cmaes", "cd"])
-    p.add_argument("--pop", type=int, default=5)
-    p.add_argument("--gens", type=int, default=6)
-    p.add_argument("--sigma", type=float, default=0.3)
-    p.add_argument("--lo", type=float, default=0.3)
-    p.add_argument("--hi", type=float, default=2.0)
-    p.add_argument("--cd_values", default="0.6,1.6")
-    p.add_argument("--cd_rounds", type=int, default=1)
+    # CMA-ES
+    p.add_argument("--pop", type=int, default=5, help="每代采样数")
+    p.add_argument("--gens", type=int, default=6, help="最多几代")
+    p.add_argument("--sigma", type=float, default=0.3, help="初始步长")
+    p.add_argument("--lo", type=float, default=0.3, help="λ 下界")
+    p.add_argument("--hi", type=float, default=2.0, help="λ 上界")
 
     p.add_argument("--eval_max_samples", type=int, default=300, help="0=全量")
     p.add_argument("--holdout", default="", help="不参与目标函数、只做最后检验的任务")
@@ -131,13 +133,15 @@ def main() -> None:
 
     def run_eval(lams, max_samples):
         merger.apply(lams)
-        accs = {}
-        for spec, ds in datasets:
-            m = evaluate(merger.model, merger.tokenizer, spec, ds,
-                         batch_size=args.batch_size, max_len=args.max_len,
-                         max_samples=max_samples, show=0)
-            accs[spec.name] = m["accuracy"]
-        merger.restore()
+        try:
+            accs = {}
+            for spec, ds in datasets:
+                m = evaluate(merger.model, merger.tokenizer, spec, ds,
+                             batch_size=args.batch_size, max_len=args.max_len,
+                             max_samples=max_samples, show=0)
+                accs[spec.name] = m["accuracy"]
+        finally:
+            merger.restore()          # 评测抛异常也要回滚，否则后续全错
         kept = [v for k, v in accs.items() if k != holdout]
         return sum(kept) / len(kept), accs
 
@@ -159,44 +163,32 @@ def main() -> None:
     record([1.0] * len(paths), s0, a0, "baseline")
     print(f"    用时 {time.time() - t0:.1f}s", flush=True)
 
-    print(f"[4/4] 搜索（mode={args.mode}, 代理样本={args.eval_max_samples}）…", flush=True)
-    if args.mode == "cmaes":
-        try:
-            import cma
-        except ImportError:
-            raise SystemExit("需要先 pip install cma")
+    print(f"[4/4] CMA-ES（pop={args.pop}, gens={args.gens}, "
+          f"sigma={args.sigma}, 代理样本={args.eval_max_samples}）…", flush=True)
 
-        es = cma.CMAEvolutionStrategy(
-            [1.0] * len(paths), args.sigma,
-            {"bounds": [args.lo, args.hi], "verbose": -9, "seed": args.seed},
-        )
-        gen = 0
-        while not es.stop() and gen < args.gens:
-            gen += 1
-            xs = es.ask()
-            print(f"  第 {gen} 代（{len(xs)} 个候选）", flush=True)
-            fs = []
-            for x in xs:
-                t = time.time()
-                score, accs = run_eval(list(x), args.eval_max_samples)
-                fs.append(-score)
-                record(x, score, accs, f"gen{gen}")
-                print(f"    ({time.time() - t:.1f}s)", flush=True)
-            es.tell(xs, fs)
-    else:
-        values = [float(v) for v in args.cd_values.split(",") if v.strip()]
-        cur, cur_score = [1.0] * len(paths), s0
-        for rnd in range(args.cd_rounds):
-            print(f"  第 {rnd + 1} 轮坐标下降", flush=True)
-            for i in range(len(paths)):
-                for v in values:
-                    cand = list(cur)
-                    cand[i] = v
-                    score, accs = run_eval(cand, args.eval_max_samples)
-                    record(cand, score, accs, f"cd_r{rnd + 1}_{tasks[i]}")
-                    if score > cur_score:
-                        cur, cur_score = cand, score
-                        print(f"    ↑ 接受 {tasks[i]}={v}", flush=True)
+    try:
+        import cma
+    except ImportError:
+        raise SystemExit("需要先 pip install cma")
+
+    es = cma.CMAEvolutionStrategy(
+        [1.0] * len(paths), args.sigma,
+        {"bounds": [args.lo, args.hi], "popsize": args.pop,
+         "verbose": -9, "seed": args.seed},
+    )
+    gen = 0
+    while not es.stop() and gen < args.gens:
+        gen += 1
+        xs = es.ask()
+        print(f"  第 {gen} 代（{len(xs)} 个候选）", flush=True)
+        fs = []
+        for x in xs:
+            t = time.time()
+            score, accs = run_eval(list(x), args.eval_max_samples)
+            fs.append(-float(score))
+            record(x, score, accs, f"gen{gen}")
+            print(f"    ({time.time() - t:.1f}s)", flush=True)
+        es.tell(xs, fs)
 
     ranked = sorted(history, key=lambda h: -h["score"])
     cands, seen = [], set()
@@ -212,10 +204,7 @@ def main() -> None:
     print(f"\n全量复核 top-{len(cands)} …", flush=True)
     for h in cands:
         t = time.time()
-        if args.eval_max_samples == 0:
-            fs, fa = run_eval(h["lams"], 0)
-        else:
-            fs, fa = run_eval(h["lams"], 0)          # 全量
+        fs, fa = run_eval(h["lams"], 0)              # 0 = 全量
         h["full_score"] = round(float(fs), 5)
         h["full_accs"] = {k: round(float(v), 5) for k, v in fa.items()}
         print(f"  {h['lams']} → full={fs:.4f}（{time.time() - t:.1f}s）", flush=True)
