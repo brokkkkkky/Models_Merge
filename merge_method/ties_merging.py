@@ -57,6 +57,9 @@ def parse_args():
     p.add_argument("--base", default="Qwen/Qwen2.5-1.5B")
     p.add_argument("--adapters", required=True, help="逗号分隔")
     p.add_argument("--lam", type=float, default=1.0, help="默认 1.0，不要除以 n")
+    p.add_argument("--lams", default=None,
+                   help="逗号分隔的逐模型权重（长度=模型数），填了就覆盖 --lam。"
+                        "权重作用在 TIES 之前，所以可以给不同任务不同的力度")
     p.add_argument("--trim", type=float, default=0.2)
     p.add_argument("--skip_embed", action="store_true",
                    help="跳过 model.embed_tokens / lm_head，全参合并时省内存")
@@ -77,6 +80,15 @@ def main() -> None:
 
     # 这里用 open_source 打开，groups里面是类：FullFTDelta 或者 AdapterDelta
     groups = [open_source(p) for p in paths]
+
+    # 逐模型权重：不填就用统一的 --lam
+    # TIES 是正齐次的，均匀权重放在前/后等价；非均匀必须在前面，否则没有意义
+    if args.lams:
+        lams = [float(s) for s in args.lams.split(",") if s.strip()]
+        if len(lams) != len(groups):
+            raise ValueError(f"--lams 有 {len(lams)} 个，--adapters 有 {len(groups)} 个，必须一样多")
+    else:
+        lams = [args.lam] * len(groups)
 
     base_set = groups[0].names
     # 判断模块是否一致
@@ -111,13 +123,15 @@ def main() -> None:
     with torch.no_grad():
         # 对每一层的不同矩阵使用TIES MERGING
         for idx, name in enumerate(modules,1):
-            deltas = [g.delta(name, named[name].weight) for g in groups]
+            # 逐任务加权放在 TIES 之前：会影响符号选举和裁剪，这正是我们要搜的东西
+            deltas = [lam * g.delta(name, named[name].weight)
+                      for lam, g in zip(lams, groups)]
 
             # 调用TIES 计算τ
             tau = ties_merge(deltas, keep = args.trim)
 
             w = named[name].weight
-            w.add_(tau.to(w.device, w.dtype) * args.lam)
+            w.add_(tau.to(w.device, w.dtype))
 
     if args.dry_run:
         print("dry_run:未保存", flush = True)
