@@ -6,6 +6,9 @@ venv/
 # 训练产物：adapter、日志、meta
 outputs/
 
+# 全参微调产物（Qwen2.5-0.5B），每个 checkpoint 约 1 GB
+outputs_ft/
+
 # 评测结果
 eval/
 
