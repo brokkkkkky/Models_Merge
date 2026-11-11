@@ -37,6 +37,7 @@ def keep_top_k(delta:torch.Tensor, keep:float) -> torch.Tensor:
     flat_nz = flat[flat > 0]
 
     # kthvalue 是 O(N) 选择算法，比 quantile 的排序快 3-5 倍，且精确
+    # 用于选择第K个大的元素
     # j = N×(1−keep) 是升序第 j 小的数，正好是"保留 keep 比例"的分界点
     n = flat_nz.numel()
     if n == 0:
