@@ -192,6 +192,8 @@ def main() -> None:
     gen = 0
     while not es.stop() and gen < args.gens:
         gen += 1
+
+        # es.ask()返回pop大小个候选
         xs = es.ask()
         print(f"  第 {gen} 代（{len(xs)} 个候选）", flush=True)
         fs = []
@@ -202,6 +204,14 @@ def main() -> None:
             record(x, score, accs, f"gen{gen}")
             print(f"    ({time.time() - t:.1f}s)", flush=True)
         es.tell(xs, fs)
+        """
+        es.tell()内部
+        1. 按 fs 排名
+        2. 改 m
+        3. 改 σ
+        4. 改 C
+        5. 下一代由 (m,σ,C) 重新采样
+        """
 
     # 取前topk个
     ranked = sorted(history, key=lambda h: -h["score"])
